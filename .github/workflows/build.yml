@@ -1,1 +1,279 @@
+name: Build A245F Android 16 (6.12) KernelSU-Next + SusFS
 
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Enable 16GB Swap and Install Build Dependencies
+        run: |
+          if [ -d /mnt ] && [ $(df -BG --output=avail /mnt | tail -1 | tr -dc '0-9') -ge 20 ]; then
+            SWAP_PATH="/mnt/swapfile"
+          else
+            SWAP_PATH="/swapfile"
+          fi
+          sudo fallocate -l 16G "$SWAP_PATH" || sudo dd if=/dev/zero of="$SWAP_PATH" bs=1M count=16384
+          sudo chmod 600 "$SWAP_PATH"
+          sudo mkswap "$SWAP_PATH"
+          sudo swapon "$SWAP_PATH"
+
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential ccache curl flex git libssl-dev libelf-dev python3 zip unzip cpio lz4 wget device-tree-compiler dwarves rsync kmod
+
+      - name: Download Android 16 Source and Stock boot.img
+        run: |
+          mkdir -p $HOME/work && cd $HOME/work
+          REPO_URL="https://github.com/${{ github.repository }}/releases/download"
+
+          if wget -q "$REPO_URL/v2.0/SM-A245F_16_Opensource.zip"; then
+            unzip -q SM-A245F_16_Opensource.zip
+            tar -xzf Kernel.tar.gz
+          elif wget -q "$REPO_URL/v2.0/Kernel.tar.gz"; then
+            tar -xzf Kernel.tar.gz
+          elif wget -q "$REPO_URL/v1.0/SM-A245F_16_Opensource.zip"; then
+            unzip -q SM-A245F_16_Opensource.zip
+            tar -xzf Kernel.tar.gz
+          else
+            wget "$REPO_URL/v1.0/Kernel.tar.gz"
+            tar -xzf Kernel.tar.gz
+          fi
+
+          if wget -q "$REPO_URL/v2.0/boot.img.lz4"; then
+            lz4 -d boot.img.lz4 boot.img
+          elif wget -q "$REPO_URL/v2.0/boot.img"; then
+            echo "Downloaded uncompressed boot.img from v2.0"
+          elif wget -q "$REPO_URL/v1.0/boot.img.lz4"; then
+            lz4 -d boot.img.lz4 boot.img
+          else
+            wget "$REPO_URL/v1.0/boot.img"
+          fi
+
+          KERNEL_DIR=$(dirname $(find $HOME/work -maxdepth 3 -path "*/kernel-6.12/Makefile" | head -n 1))
+          DEV_MOD_DIR=$(dirname $(find $HOME/work -maxdepth 4 -path "*/kernel_device_modules-6.12/build.sh" | head -n 1))
+          [ -n "$KERNEL_DIR" ] || { echo "ERROR: kernel-6.12 directory not found!"; exit 1; }
+          echo "KERNEL_DIR=$KERNEL_DIR" >> $GITHUB_ENV
+          echo "DEV_MOD_DIR=$DEV_MOD_DIR" >> $GITHUB_ENV
+
+          CONST_FILE=$(find $HOME/work -maxdepth 3 -name "build.config.constants" | head -n 1)
+          CLANG_VER=$(grep -E '^CLANG_VERSION=' "$CONST_FILE" 2>/dev/null | cut -d'=' -f2 | tr -d '"\r ')
+          [ -n "$CLANG_VER" ] || CLANG_VER="r530567"
+          echo "Detected CLANG_VERSION: $CLANG_VER"
+          echo "CLANG_VER=$CLANG_VER" >> $GITHUB_ENV
+
+      - name: Setup AOSP Clang & Magiskboot
+        run: |
+          mkdir -p "$HOME/toolchain/clang-$CLANG_VER"
+          cd "$HOME/toolchain/clang-$CLANG_VER"
+          wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android16-release/clang-${CLANG_VER}.tar.gz" || \
+          wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-${CLANG_VER}.tar.gz" || \
+          wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r530567.tar.gz"
+          tar -xzf clang-*.tar.gz && rm -f clang-*.tar.gz
+
+          mkdir -p $HOME/tools && cd $HOME/tools
+          wget -q https://github.com/topjohnwu/Magisk/releases/download/v28.1/Magisk-v28.1.apk -O magisk.zip
+          unzip -p magisk.zip lib/x86_64/libmagiskboot.so > magiskboot
+          chmod +x magiskboot
+
+          mkdir -p $HOME/work/stock_unpack && cd $HOME/work/stock_unpack
+          cp $HOME/work/boot.img .
+          $HOME/tools/magiskboot unpack boot.img
+          STOCK_VER=$(strings kernel | grep -m1 "Linux version " | awk '{print $3}')
+          STOCK_LOCALVER=$(echo "$STOCK_VER" | sed -E 's/^[0-9]+\.[0-9]+\.[0-9]+//')
+          echo "Stock Kernel Full Version: $STOCK_VER"
+          echo "Extracted Stock LOCALVERSION: $STOCK_LOCALVER"
+          echo "STOCK_LOCALVER=$STOCK_LOCALVER" >> $GITHUB_ENV
+
+      - name: Integrate KernelSU-Next, SusFS (6.12), and Module CRC Compatibility
+        run: |
+          chmod -R u+w "$KERNEL_DIR"
+          cd "$KERNEL_DIR"
+          touch .scmversion
+
+          if ! curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next-susfs/kernel/setup.sh" | bash -s next-susfs; then
+            curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+          fi
+
+          git clone --depth=1 -b gki-android16-6.12 https://gitlab.com/simonpunk/susfs4ksu.git $HOME/susfs4ksu
+          if ! grep -rq "susfs" KernelSU-Next/ 2>/dev/null && [ -f "$HOME/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" ]; then
+            patch -d KernelSU-Next -p1 --fuzz=4 --no-backup-if-mismatch < "$HOME/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
+          fi
+
+          cp -r $HOME/susfs4ksu/kernel_patches/fs/* fs/
+          cp -r $HOME/susfs4ksu/kernel_patches/include/linux/* include/linux/
+          patch -p1 --fuzz=4 --no-backup-if-mismatch < $HOME/susfs4ksu/kernel_patches/50_add_susfs_in_gki-android16-6.12.patch || true
+
+          python3 - << 'EOF'
+          import os, re, glob
+
+          ns_file = "fs/namespace.c"
+          ns_rej = "fs/namespace.c.rej"
+          if os.path.exists(ns_file):
+              os.chmod(ns_file, 0o644)
+              with open(ns_file, "r") as f:
+                  content = f.read()
+
+              header_target = "unsigned int sysctl_mount_max"
+              header_inject = (
+                  "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+                  "extern bool susfs_is_current_ksu_domain(void);\n"
+                  "extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\n\n"
+                  "#define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */\n"
+                  "#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\n"
+              )
+              if "CL_COPY_MNT_NS BIT(25)" not in content and header_target in content:
+                  content = content.replace(header_target, header_inject + header_target, 1)
+                  print("Auto-patched header definitions in fs/namespace.c")
+
+              if "copy_flags |= CL_COPY_MNT_NS;" not in content:
+                  pattern = r'(copy_flags\s*\|=\s*CL_SHARED_TO_SLAVE;)'
+                  replacement = (
+                      r'\1\n'
+                      r'#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n'
+                      r'\tcopy_flags |= CL_COPY_MNT_NS;\n'
+                      r'#endif'
+                  )
+                  new_content, count = re.subn(pattern, replacement, content, count=1)
+                  if count > 0:
+                      content = new_content
+                      print("Auto-patched copy_mnt_ns in fs/namespace.c")
+
+              with open(ns_file, "w") as f:
+                  f.write(content)
+
+              if (
+                  "CL_COPY_MNT_NS BIT(25)" in content
+                  and "copy_flags |= CL_COPY_MNT_NS;" in content
+                  and os.path.exists(ns_rej)
+              ):
+                  os.remove(ns_rej)
+                  print("Removed resolved fs/namespace.c.rej")
+
+          for mod_file in ["kernel/module.c", "kernel/module/version.c"]:
+              if os.path.exists(mod_file):
+                  os.chmod(mod_file, 0o644)
+                  with open(mod_file, "r") as f:
+                      mcontent = f.read()
+                  m = re.search(r'static\s+int\s+check_version\s*\([^;]*?\)\s*\{', mcontent, flags=re.DOTALL)
+                  if m:
+                      idx = m.start()
+                      end_idx = mcontent.find("\n}", idx)
+                      if end_idx != -1:
+                          func_body = mcontent[idx:end_idx]
+                          if "return 0;" in func_body:
+                              func_body = func_body.replace("return 0;", "return 1;")
+                              mcontent = mcontent[:idx] + func_body + mcontent[end_idx:]
+                              with open(mod_file, "w") as f:
+                                  f.write(mcontent)
+                              print(f"Patched check_version return value in {mod_file}")
+
+          rejs = sorted(glob.glob("**/*.rej", recursive=True))
+          if rejs:
+              print("=== REMAINING SUSFS PATCH REJECTS ===")
+              for r in rejs:
+                  print(f"\n--- REJECT FILE: {r} ---")
+                  with open(r, "r") as f:
+                      print(f.read())
+              raise SystemExit(1)
+          print("=== ALL SUSFS PATCHES APPLIED CLEANLY ===")
+          EOF
+
+      - name: Configure Defconfig and Disable Samsung Protections
+        run: |
+          export PATH="$HOME/toolchain/clang-$CLANG_VER/bin:$PATH"
+          export ARCH=arm64
+          export LLVM=1
+          export LLVM_IAS=1
+
+          cd "$KERNEL_DIR"
+          mkdir -p out
+
+          if ./scripts/extract-ikconfig "$HOME/work/stock_unpack/kernel" > out/.config 2>/dev/null && grep -q "CONFIG_ARM64=y" out/.config; then
+            echo "Successfully extracted exact stock .config from A24 Android 16 boot.img!"
+          else
+            echo "Fallback: merging gki_defconfig with A24 build_kernel.sh overlays..."
+            BASE_CFG=$(find "$KERNEL_DIR" "$DEV_MOD_DIR" -name "gki_defconfig" 2>/dev/null | head -n 1)
+            FRAG_LIST="$BASE_CFG"
+            for frag in mediatek-bazel_defconfig entry_level.config sec_ogki_fragment.config mt6789_disable_mtk_charger_overlay.config mt6789_teegris_4_overlay.config; do
+              FPATH=$(find "$KERNEL_DIR" "$DEV_MOD_DIR" -name "$frag" 2>/dev/null | head -n 1)
+              [ -n "$FPATH" ] && FRAG_LIST="$FRAG_LIST $FPATH"
+            done
+            ARCH=arm64 ./scripts/kconfig/merge_config.sh -m -O out $FRAG_LIST
+          fi
+
+          ./scripts/config --file out/.config \
+            -e KSU \
+            -d KSU_WITH_KPROBES \
+            -d KSU_KPROBES_HOOK \
+            -e KSU_SUSFS \
+            -e KSU_SUSFS_SUS_PATH \
+            -e KSU_SUSFS_SUS_MOUNT \
+            -e KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT \
+            -e KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT \
+            -e KSU_SUSFS_SUS_KSTAT \
+            -e KSU_SUSFS_TRY_UMOUNT \
+            -e KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT \
+            -e KSU_SUSFS_SPOOF_UNAME \
+            -e KSU_SUSFS_ENABLE_LOG \
+            -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+            -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+            -e KSU_SUSFS_OPEN_REDIRECT \
+            -d TRIM_UNUSED_KSYMS \
+            -d WERROR \
+            -d UBSAN_TRAP \
+            -d LTO_CLANG_FULL \
+            -e LTO_CLANG_THIN \
+            -d SECURITY_DEFEX \
+            -d PROCA \
+            -d FIVE \
+            -d SECURITY_DSMS \
+            -d RKP \
+            -d UH \
+            -d UH_RKP \
+            -d UH_LKMAUTH \
+            -d KDP \
+            -d KDP_CRED \
+            -d KDP_NS \
+            -d MODULE_SIG_FORCE \
+            -d LOCALVERSION_AUTO
+
+          if [ -n "$STOCK_LOCALVER" ]; then
+            ./scripts/config --file out/.config --set-str LOCALVERSION "$STOCK_LOCALVER"
+          fi
+
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+
+      - name: Compile A24 Android 16 Kernel
+        run: |
+          set -o pipefail
+          export PATH="$HOME/toolchain/clang-$CLANG_VER/bin:$PATH"
+          export LLVM=1
+          export LLVM_IAS=1
+          export DEPMOD=depmod
+          export DTC_FLAGS="-@"
+          export ARCH=arm64
+
+          cd "$KERNEL_DIR"
+          make O=out LOCALVERSION="$STOCK_LOCALVER" -j$(nproc) Image 2>&1 | tee /tmp/a24_16_build.log || {
+            echo "=== COMPILER ERROR SUMMARY ==="
+            grep -iE "error:|fatal error:" /tmp/a24_16_build.log | tail -n 30
+            exit 1
+          }
+          echo "Compiled Kernel Version: $(strings out/arch/arm64/boot/Image | grep -m1 'Linux version ')"
+
+      - name: Repack boot.img and Create Odin Tar
+        run: |
+          mkdir -p /home/runner/output && cd /home/runner/output
+          cp $HOME/work/boot.img .
+          $HOME/tools/magiskboot unpack boot.img
+          cp "$KERNEL_DIR/out/arch/arm64/boot/Image" kernel
+          $HOME/tools/magiskboot repack boot.img new-boot.img
+          mv new-boot.img boot.img
+          tar --format=ustar -cvf A245F_A16_KSU_SusFS_boot.tar boot.img
+
+      - name: Upload Ready Odin Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: A245F-A16-KSU-SusFS-Odin
+          path: /home/runner/output/A245F_A16_KSU_SusFS_boot.tar
