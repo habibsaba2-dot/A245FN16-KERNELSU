@@ -116,7 +116,7 @@ jobs:
           python3 - << 'EOF'
           import os, re, glob
 
-          # Fix KernelSU-Next header include paths for Linux 6.12 out-of-tree subdirs
+          # Fix KernelSU-Next header include paths and preinit/runner path for Linux 6.12
           ksu_inc_dirs = {"$(srctree)/drivers/kernelsu", "$(srctree)/drivers/kernelsu/include"}
           for root, _, files in os.walk("drivers/kernelsu", followlinks=True):
               for fn in files:
@@ -133,14 +133,16 @@ jobs:
                   os.chmod(real_kfile, 0o644)
                   with open(real_kfile, "r") as f:
                       kcontent = f.read()
+                  kcontent = kcontent.replace("$(srctree)/$(src)", "$(srctree)/drivers/kernelsu")
                   kcontent = kcontent.replace("$(src)", "$(srctree)/drivers/kernelsu")
+                  kcontent = kcontent.replace("$(srctree)/$(srctree)", "$(srctree)")
                   header_inject = (
                       f"subdir-ccflags-y += {inc_flags}\n"
                       f"ccflags-y += {inc_flags}\n"
                   )
                   with open(real_kfile, "w") as f:
                       f.write(header_inject + kcontent)
-                  print(f"Fixed include paths in {real_kfile}")
+                  print(f"Fixed paths in {real_kfile}")
 
           ns_file = "fs/namespace.c"
           ns_rej = "fs/namespace.c.rej"
