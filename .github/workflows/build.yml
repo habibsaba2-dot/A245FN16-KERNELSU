@@ -51,10 +51,8 @@ jobs:
           fi
 
           KERNEL_DIR=$(dirname $(find $HOME/work -maxdepth 3 -path "*/kernel-6.12/Makefile" | head -n 1))
-          DEV_MOD_DIR=$(dirname $(find $HOME/work -maxdepth 4 -path "*/kernel_device_modules-6.12/build.sh" | head -n 1))
           [ -n "$KERNEL_DIR" ] || { echo "ERROR: kernel-6.12 directory not found!"; exit 1; }
           echo "KERNEL_DIR=$KERNEL_DIR" >> $GITHUB_ENV
-          echo "DEV_MOD_DIR=$DEV_MOD_DIR" >> $GITHUB_ENV
 
           CONST_FILE=$(find $HOME/work -maxdepth 3 -name "build.config.constants" | head -n 1)
           CLANG_VER=$(grep -E '^CLANG_VERSION=' "$CONST_FILE" 2>/dev/null | cut -d'=' -f2 | tr -d '"\r ')
@@ -174,7 +172,7 @@ jobs:
           print("=== ALL SUSFS PATCHES APPLIED CLEANLY ===")
           EOF
 
-      - name: Configure Defconfig and Disable Samsung Protections
+      - name: Configure GKI 6.12 Defconfig
         run: |
           export PATH="$HOME/toolchain/clang-$CLANG_VER/bin:$PATH"
           export ARCH=arm64
@@ -184,17 +182,12 @@ jobs:
           cd "$KERNEL_DIR"
           mkdir -p out
 
-          if ./scripts/extract-ikconfig "$HOME/work/stock_unpack/kernel" > out/.config 2>/dev/null && grep -q "CONFIG_ARM64=y" out/.config; then
-            echo "Successfully extracted exact stock .config from A24 Android 16 boot.img!"
+          if [ -f "arch/arm64/configs/gki_defconfig" ]; then
+            echo "Using clean GKI 6.12 defconfig..."
+            make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
           else
-            echo "Fallback: merging gki_defconfig with A24 build_kernel.sh overlays..."
-            BASE_CFG=$(find "$KERNEL_DIR" "$DEV_MOD_DIR" -name "gki_defconfig" 2>/dev/null | head -n 1)
-            FRAG_LIST="$BASE_CFG"
-            for frag in mediatek-bazel_defconfig entry_level.config sec_ogki_fragment.config mt6789_disable_mtk_charger_overlay.config mt6789_teegris_4_overlay.config; do
-              FPATH=$(find "$KERNEL_DIR" "$DEV_MOD_DIR" -name "$frag" 2>/dev/null | head -n 1)
-              [ -n "$FPATH" ] && FRAG_LIST="$FRAG_LIST $FPATH"
-            done
-            ARCH=arm64 ./scripts/kconfig/merge_config.sh -m -O out $FRAG_LIST
+            echo "Fallback: extracting stock ikconfig..."
+            ./scripts/extract-ikconfig "$HOME/work/stock_unpack/kernel" > out/.config
           fi
 
           ./scripts/config --file out/.config \
@@ -202,6 +195,14 @@ jobs:
             --set-str SYSTEM_REVOCATION_KEYS "" \
             --set-str MODULE_SIG_KEY "" \
             --set-str UNUSED_KSYMS_WHITELIST "" \
+            -d RUST \
+            -d TRIM_UNUSED_KSYMS \
+            -d WERROR \
+            -d UBSAN_TRAP \
+            -d CFI_CLANG \
+            -d CFI_PERMISSIVE \
+            -d LTO_CLANG_FULL \
+            -e LTO_CLANG_THIN \
             -e KSU \
             -d KSU_WITH_KPROBES \
             -d KSU_KPROBES_HOOK \
@@ -218,11 +219,6 @@ jobs:
             -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
             -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
             -e KSU_SUSFS_OPEN_REDIRECT \
-            -d TRIM_UNUSED_KSYMS \
-            -d WERROR \
-            -d UBSAN_TRAP \
-            -d LTO_CLANG_FULL \
-            -e LTO_CLANG_THIN \
             -d SECURITY_DEFEX \
             -d PROCA \
             -d FIVE \
@@ -255,10 +251,8 @@ jobs:
 
           cd "$KERNEL_DIR"
           make O=out LOCALVERSION="$STOCK_LOCALVER" -j$(nproc) Image 2>&1 | tee /tmp/a24_16_build.log || {
-            echo "=== LAST 40 LINES OF BUILD LOG ==="
-            tail -n 40 /tmp/a24_16_build.log
-            echo "=== MATCHED FAILURE PATTERNS ==="
-            grep -iE "error:|fatal error:|No rule to make target|Permission denied|not found|Stop\." /tmp/a24_16_build.log | tail -n 30
+            echo "=== FIRST FAILURE CONTEXT IN BUILD LOG ==="
+            grep -n -B 15 -A 5 "\*\*\*" /tmp/a24_16_build.log | head -n 50
             exit 1
           }
           echo "Compiled Kernel Version: $(strings out/arch/arm64/boot/Image | grep -m1 'Linux version ')"
