@@ -56,18 +56,28 @@ jobs:
 
           CONST_FILE=$(find $HOME/work -maxdepth 3 -name "build.config.constants" | head -n 1)
           CLANG_VER=$(grep -E '^CLANG_VERSION=' "$CONST_FILE" 2>/dev/null | cut -d'=' -f2 | tr -d '"\r ')
-          [ -n "$CLANG_VER" ] || CLANG_VER="r530567"
+          [ -n "$CLANG_VER" ] || CLANG_VER="r536225"
           echo "Detected CLANG_VERSION: $CLANG_VER"
           echo "CLANG_VER=$CLANG_VER" >> $GITHUB_ENV
 
+      - name: Cache AOSP Clang Toolchain
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/toolchain
+          key: aosp-clang-${{ env.CLANG_VER }}
+
       - name: Setup AOSP Clang & Magiskboot
         run: |
-          mkdir -p "$HOME/toolchain/clang-$CLANG_VER"
-          cd "$HOME/toolchain/clang-$CLANG_VER"
-          wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android16-release/clang-${CLANG_VER}.tar.gz" || \
-          wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-${CLANG_VER}.tar.gz" || \
-          wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r530567.tar.gz"
-          tar -xzf clang-*.tar.gz && rm -f clang-*.tar.gz
+          if [ ! -d "/home/runner/toolchain/clang-$CLANG_VER/bin" ]; then
+            mkdir -p "/home/runner/toolchain/clang-$CLANG_VER"
+            cd "/home/runner/toolchain/clang-$CLANG_VER"
+            wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android16-release/clang-${CLANG_VER}.tar.gz" || \
+            wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-${CLANG_VER}.tar.gz"
+            tar -xzf clang-*.tar.gz && rm -f clang-*.tar.gz
+          else
+            echo "Using cached AOSP Clang $CLANG_VER!"
+          fi
 
           mkdir -p $HOME/tools && cd $HOME/tools
           wget -q https://github.com/topjohnwu/Magisk/releases/download/v28.1/Magisk-v28.1.apk -O magisk.zip
@@ -174,7 +184,7 @@ jobs:
 
       - name: Configure GKI 6.12 Defconfig
         run: |
-          export PATH="$HOME/toolchain/clang-$CLANG_VER/bin:$PATH"
+          export PATH="/home/runner/toolchain/clang-$CLANG_VER/bin:$PATH"
           export ARCH=arm64
           export LLVM=1
           export LLVM_IAS=1
@@ -242,7 +252,7 @@ jobs:
       - name: Compile A24 Android 16 Kernel
         run: |
           set -o pipefail
-          export PATH="$HOME/toolchain/clang-$CLANG_VER/bin:$PATH"
+          export PATH="/home/runner/toolchain/clang-$CLANG_VER/bin:$PATH"
           export LLVM=1
           export LLVM_IAS=1
           export DEPMOD=depmod
@@ -250,11 +260,12 @@ jobs:
           export ARCH=arm64
 
           cd "$KERNEL_DIR"
-          make O=out LOCALVERSION="$STOCK_LOCALVER" -j$(nproc) Image 2>&1 | tee /tmp/a24_16_build.log || {
-            echo "=== FIRST FAILURE CONTEXT IN BUILD LOG ==="
-            grep -n -B 15 -A 5 "\*\*\*" /tmp/a24_16_build.log | head -n 50
+          make O=out LOCALVERSION="" -j$(nproc) Image > /tmp/a24_16_build.log 2>&1 || {
+            echo "=== FULL BUILD LOG ==="
+            cat /tmp/a24_16_build.log
             exit 1
           }
+          tail -n 30 /tmp/a24_16_build.log
           echo "Compiled Kernel Version: $(strings out/arch/arm64/boot/Image | grep -m1 'Linux version ')"
 
       - name: Repack boot.img and Create Odin Tar
