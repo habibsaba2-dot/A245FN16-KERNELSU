@@ -22,7 +22,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y bc bison build-essential ccache curl flex gawk git libssl-dev libelf-dev openssl perl python3 zip unzip cpio lz4 wget device-tree-compiler dwarves rsync kmod xxd
 
-      - name: Download Android 16 Source and Stock boot.img
+      - name: Download Android 16 Source, Stock boot.img, and vbmeta.img
         run: |
           mkdir -p $HOME/work && cd $HOME/work
           REPO_URL="https://github.com/${{ github.repository }}/releases/download"
@@ -50,6 +50,14 @@ jobs:
             wget "$REPO_URL/v1.0/boot.img"
           fi
 
+          if wget -q "$REPO_URL/v2.0/vbmeta.img.lz4"; then
+            lz4 -d vbmeta.img.lz4 stock_vbmeta.img
+            echo "Downloaded stock vbmeta.img.lz4 from v2.0"
+          elif wget -q "$REPO_URL/v2.0/vbmeta.img"; then
+            mv vbmeta.img stock_vbmeta.img
+            echo "Downloaded stock vbmeta.img from v2.0"
+          fi
+
           KERNEL_DIR=$(dirname $(find $HOME/work -maxdepth 3 -path "*/kernel-6.12/Makefile" | head -n 1))
           [ -n "$KERNEL_DIR" ] || { echo "ERROR: kernel-6.12 directory not found!"; exit 1; }
           echo "KERNEL_DIR=$KERNEL_DIR" >> $GITHUB_ENV
@@ -67,7 +75,7 @@ jobs:
           path: /home/runner/toolchain
           key: aosp-clang-${{ env.CLANG_VER }}
 
-      - name: Setup AOSP Clang & Magiskboot
+      - name: Setup AOSP Clang, Magiskboot, and AVBTool
         run: |
           if [ ! -d "/home/runner/toolchain/clang-$CLANG_VER/bin" ]; then
             mkdir -p "/home/runner/toolchain/clang-$CLANG_VER"
@@ -84,8 +92,14 @@ jobs:
           unzip -p magisk.zip lib/x86_64/libmagiskboot.so > magiskboot
           chmod +x magiskboot
 
+          wget -q "https://android.googlesource.com/platform/external/avb/+/refs/heads/main/avbtool.py?format=TEXT" -O avbtool.b64
+          base64 -d avbtool.b64 > avbtool.py
+          chmod +x avbtool.py
+
           mkdir -p $HOME/work/stock_unpack && cd $HOME/work/stock_unpack
           cp $HOME/work/boot.img .
+          STOCK_BOOT_SIZE=$(stat -c%s boot.img)
+          echo "STOCK_BOOT_SIZE=$STOCK_BOOT_SIZE" >> $GITHUB_ENV
           $HOME/tools/magiskboot unpack boot.img
           STOCK_VER=$(strings kernel | grep -m1 "Linux version " | awk '{print $3}')
           STOCK_LOCALVER=$(echo "$STOCK_VER" | sed -E 's/^[0-9]+\.[0-9]+\.[0-9]+//')
@@ -141,7 +155,6 @@ jobs:
                   )
                   with open(real_kfile, "w") as f:
                       f.write(header_inject + kcontent)
-                  print(f"Fixed paths in {real_kfile}")
 
           ns_file = "fs/namespace.c"
           ns_rej = "fs/namespace.c.rej"
@@ -200,9 +213,7 @@ jobs:
 
           rejs = sorted(glob.glob("**/*.rej", recursive=True))
           if rejs:
-              print("=== REMAINING SUSFS PATCH REJECTS ===")
               for r in rejs:
-                  print(f"\n--- REJECT FILE: {r} ---")
                   with open(r, "r") as f:
                       print(f.read())
               raise SystemExit(1)
@@ -220,10 +231,8 @@ jobs:
           mkdir -p out
 
           if [ -f "arch/arm64/configs/gki_defconfig" ]; then
-            echo "Using clean GKI 6.12 defconfig..."
             make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 gki_defconfig
           else
-            echo "Fallback: extracting stock ikconfig..."
             ./scripts/extract-ikconfig "$HOME/work/stock_unpack/kernel" > out/.config
           fi
 
@@ -290,14 +299,13 @@ jobs:
 
           cd "$KERNEL_DIR"
           make O=out LOCALVERSION="" -j$(nproc) Image > /tmp/a24_16_build.log 2>&1 || {
-            echo "=== LAST 80 LINES OF BUILD LOG ==="
             tail -n 80 /tmp/a24_16_build.log
             exit 1
           }
           tail -n 30 /tmp/a24_16_build.log
           echo "Compiled Kernel Version: $(strings out/arch/arm64/boot/Image | grep -m1 'Linux version ')"
 
-      - name: Repack boot.img and Create Odin Tar
+      - name: Repack boot.img with AVB Footer, Patch vbmeta, and Create Odin Tar
         run: |
           mkdir -p /home/runner/output && cd /home/runner/output
           cp $HOME/work/boot.img .
@@ -305,7 +313,33 @@ jobs:
           cp "$KERNEL_DIR/out/arch/arm64/boot/Image" kernel
           $HOME/tools/magiskboot repack boot.img new-boot.img
           mv new-boot.img boot.img
-          tar --format=ustar -cvf A245F_A16_KSU_SusFS_boot.tar boot.img
+
+          PART_SIZE="${STOCK_BOOT_SIZE:-67108864}"
+          python3 $HOME/tools/avbtool.py add_hash_footer \
+            --image boot.img \
+            --partition_name boot \
+            --partition_size "$PART_SIZE" \
+            --hash_algorithm sha256
+
+          if [ -f "$HOME/work/stock_vbmeta.img" ]; then
+            cp "$HOME/work/stock_vbmeta.img" vbmeta.img
+            python3 -c '
+          with open("vbmeta.img", "r+b") as f:
+              data = bytearray(f.read())
+              if data[:4] == b"AVB0":
+                  data[123] = 0x03
+                  f.seek(0)
+                  f.write(data)
+                  print("Patched stock Samsung vbmeta.img flags to 0x03 (VERIFICATION_DISABLED)")
+          '
+          else
+            python3 $HOME/tools/avbtool.py make_vbmeta_image \
+              --flags 3 \
+              --padding_size 4096 \
+              --output vbmeta.img
+          fi
+
+          tar --format=ustar -cvf A245F_A16_KSU_SusFS_boot.tar boot.img vbmeta.img
 
       - name: Upload Ready Odin Package
         uses: actions/upload-artifact@v4
