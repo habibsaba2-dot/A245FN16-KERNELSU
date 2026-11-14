@@ -20,7 +20,7 @@ jobs:
           sudo swapon "$SWAP_PATH"
 
           sudo apt-get update
-          sudo apt-get install -y bc bison build-essential ccache curl flex git libssl-dev libelf-dev python3 zip unzip cpio lz4 wget device-tree-compiler dwarves rsync kmod
+          sudo apt-get install -y bc bison build-essential ccache curl flex gawk git libssl-dev libelf-dev openssl perl python3 zip unzip cpio lz4 wget device-tree-compiler dwarves rsync kmod xxd
 
       - name: Download Android 16 Source and Stock boot.img
         run: |
@@ -88,6 +88,7 @@ jobs:
       - name: Integrate KernelSU-Next, SusFS (6.12), and Module CRC Compatibility
         run: |
           chmod -R u+w "$KERNEL_DIR"
+          find "$KERNEL_DIR/scripts" -type f -exec chmod +x {} + 2>/dev/null || true
           cd "$KERNEL_DIR"
           touch .scmversion
 
@@ -124,7 +125,6 @@ jobs:
               )
               if "CL_COPY_MNT_NS BIT(25)" not in content and header_target in content:
                   content = content.replace(header_target, header_inject + header_target, 1)
-                  print("Auto-patched header definitions in fs/namespace.c")
 
               if "copy_flags |= CL_COPY_MNT_NS;" not in content:
                   pattern = r'(copy_flags\s*\|=\s*CL_SHARED_TO_SLAVE;)'
@@ -134,10 +134,7 @@ jobs:
                       r'\tcopy_flags |= CL_COPY_MNT_NS;\n'
                       r'#endif'
                   )
-                  new_content, count = re.subn(pattern, replacement, content, count=1)
-                  if count > 0:
-                      content = new_content
-                      print("Auto-patched copy_mnt_ns in fs/namespace.c")
+                  content, _ = re.subn(pattern, replacement, content, count=1)
 
               with open(ns_file, "w") as f:
                   f.write(content)
@@ -148,7 +145,6 @@ jobs:
                   and os.path.exists(ns_rej)
               ):
                   os.remove(ns_rej)
-                  print("Removed resolved fs/namespace.c.rej")
 
           for mod_file in ["kernel/module.c", "kernel/module/version.c"]:
               if os.path.exists(mod_file):
@@ -166,7 +162,6 @@ jobs:
                               mcontent = mcontent[:idx] + func_body + mcontent[end_idx:]
                               with open(mod_file, "w") as f:
                                   f.write(mcontent)
-                              print(f"Patched check_version return value in {mod_file}")
 
           rejs = sorted(glob.glob("**/*.rej", recursive=True))
           if rejs:
@@ -203,6 +198,10 @@ jobs:
           fi
 
           ./scripts/config --file out/.config \
+            --set-str SYSTEM_TRUSTED_KEYS "" \
+            --set-str SYSTEM_REVOCATION_KEYS "" \
+            --set-str MODULE_SIG_KEY "" \
+            --set-str UNUSED_KSYMS_WHITELIST "" \
             -e KSU \
             -d KSU_WITH_KPROBES \
             -d KSU_KPROBES_HOOK \
@@ -256,8 +255,10 @@ jobs:
 
           cd "$KERNEL_DIR"
           make O=out LOCALVERSION="$STOCK_LOCALVER" -j$(nproc) Image 2>&1 | tee /tmp/a24_16_build.log || {
-            echo "=== COMPILER ERROR SUMMARY ==="
-            grep -iE "error:|fatal error:" /tmp/a24_16_build.log | tail -n 30
+            echo "=== LAST 40 LINES OF BUILD LOG ==="
+            tail -n 40 /tmp/a24_16_build.log
+            echo "=== MATCHED FAILURE PATTERNS ==="
+            grep -iE "error:|fatal error:|No rule to make target|Permission denied|not found|Stop\." /tmp/a24_16_build.log | tail -n 30
             exit 1
           }
           echo "Compiled Kernel Version: $(strings out/arch/arm64/boot/Image | grep -m1 'Linux version ')"
