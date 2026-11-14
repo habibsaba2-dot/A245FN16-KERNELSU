@@ -116,6 +116,32 @@ jobs:
           python3 - << 'EOF'
           import os, re, glob
 
+          # Fix KernelSU-Next header include paths for Linux 6.12 out-of-tree subdirs
+          ksu_inc_dirs = {"$(srctree)/drivers/kernelsu", "$(srctree)/drivers/kernelsu/include"}
+          for root, _, files in os.walk("drivers/kernelsu", followlinks=True):
+              for fn in files:
+                  if fn.endswith(".h"):
+                      rel = root.replace("\\", "/")
+                      ksu_inc_dirs.add(f"$(srctree)/{rel}")
+                      if rel.endswith("/uapi"):
+                          ksu_inc_dirs.add(f"$(srctree)/{os.path.dirname(rel)}")
+
+          inc_flags = " ".join(f"-I{d}" for d in sorted(ksu_inc_dirs))
+          for kfile in ["drivers/kernelsu/Kbuild", "drivers/kernelsu/Makefile"]:
+              if os.path.exists(kfile):
+                  real_kfile = os.path.realpath(kfile)
+                  os.chmod(real_kfile, 0o644)
+                  with open(real_kfile, "r") as f:
+                      kcontent = f.read()
+                  kcontent = kcontent.replace("$(src)", "$(srctree)/drivers/kernelsu")
+                  header_inject = (
+                      f"subdir-ccflags-y += {inc_flags}\n"
+                      f"ccflags-y += {inc_flags}\n"
+                  )
+                  with open(real_kfile, "w") as f:
+                      f.write(header_inject + kcontent)
+                  print(f"Fixed include paths in {real_kfile}")
+
           ns_file = "fs/namespace.c"
           ns_rej = "fs/namespace.c.rej"
           if os.path.exists(ns_file):
@@ -261,8 +287,8 @@ jobs:
 
           cd "$KERNEL_DIR"
           make O=out LOCALVERSION="" -j$(nproc) Image > /tmp/a24_16_build.log 2>&1 || {
-            echo "=== FULL BUILD LOG ==="
-            cat /tmp/a24_16_build.log
+            echo "=== LAST 80 LINES OF BUILD LOG ==="
+            tail -n 80 /tmp/a24_16_build.log
             exit 1
           }
           tail -n 30 /tmp/a24_16_build.log
