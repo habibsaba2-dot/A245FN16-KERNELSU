@@ -116,7 +116,6 @@ jobs:
           python3 - << 'EOF'
           import os, re, glob
 
-          # Fix KernelSU-Next header include paths and preinit/runner path for Linux 6.12
           ksu_inc_dirs = {"$(srctree)/drivers/kernelsu", "$(srctree)/drivers/kernelsu/include"}
           for root, _, files in os.walk("drivers/kernelsu", followlinks=True):
               for fn in files:
@@ -233,6 +232,8 @@ jobs:
             --set-str SYSTEM_REVOCATION_KEYS "" \
             --set-str MODULE_SIG_KEY "" \
             --set-str UNUSED_KSYMS_WHITELIST "" \
+            -d DEBUG_INFO_BTF \
+            -d DEBUG_INFO_BTF_MODULES \
             -d RUST \
             -d TRIM_UNUSED_KSYMS \
             -d WERROR \
